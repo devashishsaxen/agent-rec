@@ -248,70 +248,124 @@ async def initiate_call(phone_number: str = Form(...)):
         return {"success": False, "error": str(e)}
 
 @app.post("/twilio-webhook")
-async def twilio_webhook(request: Request, session_id: str = None, RecordingUrl: str = None, CallStatus: str = None):
-    """Handle Twilio webhooks for call flow."""
+async def twilio_webhook(
+    request: Request, 
+    session_id: str = None, 
+    RecordingUrl: str = None,
+    CallStatus: str = None
+):
+    """Handle Twilio webhooks with error recovery."""
     response = VoiceResponse()
     
+    print(f"Webhook called - Session: {session_id}, Recording: {RecordingUrl}, Status: {CallStatus}")
+    
     if not session_id or session_id not in sessions:
-        response.say("Sorry, this session has expired.")
+        print("ERROR: Session not found")
+        response.say("Sorry, this session has expired. Please call again.")
         return Response(content=str(response), media_type="application/xml")
     
     session = sessions[session_id]
     
-    # If we have a recording (user spoke), process it
+    # Process recording if present
     if RecordingUrl:
         try:
-            # Download and transcribe recording
-            audio_content = requests.get(RecordingUrl).content
+            print(f"Downloading recording from: {RecordingUrl}")
+            # Download recording
+            audio_content = requests.get(RecordingUrl, timeout=30).content
             
             # Save temporarily
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 tmp.write(audio_content)
                 tmp_path = tmp.name
             
-            # Transcribe with AssemblyAI
-            config = aai.TranscriptionConfig(speech_models=["universal-2"], language_code="en_us")
+            print("Transcribing with AssemblyAI...")
+            # Transcribe
+            config = aai.TranscriptionConfig(
+                speech_models=["universal-2"], 
+                language_code="en_us"
+            )
             transcriber = aai.Transcriber(config=config)
             transcript = transcriber.transcribe(tmp_path)
+            
+            # Cleanup
             os.unlink(tmp_path)
             
-            if transcript.text:
-                user_input = transcript.text
-                reply = get_reply(session, user_input)
+            if transcript.status == "error":
+                print(f"Transcription error: {transcript.error}")
+                user_input = ""
             else:
-                reply = "I didn't catch that. Could you please speak up?"
+                user_input = transcript.text
+                print(f"User said: {user_input}")
                 
         except Exception as e:
-            print(f"Transcription error: {e}")
-            reply = "Sorry, I had trouble understanding. Please try again."
+            print(f"Transcription failed: {e}")
+            user_input = ""
     else:
-        # First call or no recording yet
-        if session.current_audio_url:
-            reply = None  # Already generated
+        print("No recording, first call")
+        user_input = ""
+    
+    # Get reply from conversation flow
+    try:
+        if not user_input or not user_input.strip():
+            if session.state in [ConversationState.CUSTOMER_STORY, ConversationState.FESTIVAL_STORY]:
+                session.retry_count += 1
+                if session.retry_count >= 2:
+                    session.state = ConversationState.REJECTED
+                    reply = "Sorry, we will not be able to help you with job as we hire candidates with good communication skills only."
+                else:
+                    if session.state == ConversationState.CUSTOMER_STORY:
+                        session.state = ConversationState.CUSTOMER_RETRY
+                    else:
+                        session.state = ConversationState.FESTIVAL_RETRY
+                    reply = "Sorry, you need to speak on this topic. Please try now."
+            else:
+                reply = "I didn't catch that. Could you please speak up?"
         else:
-            reply = get_reply(session, "")
+            reply = get_reply(session, user_input)
+        
+        print(f"Riya replies: {reply}")
+        
+    except Exception as e:
+        print(f"Conversation flow error: {e}")
+        reply = "I'm sorry, could you please repeat that?"
     
-    # Generate TTS for reply if needed
-    if reply:
-        audio_url = generate_tts(reply, session_id)
-        session.current_audio_url = audio_url
+    # Generate TTS with fallback
+    audio_url = None
+    try:
+        if reply:
+            audio_url = generate_tts(reply, session_id)
+            session.current_audio_url = audio_url
+    except Exception as e:
+        print(f"TTS generation failed: {e}")
+        audio_url = None
     
-    # Play the audio
-    if session.current_audio_url:
-        response.play(session.current_audio_url)
+    # Build TwiML response
+    if audio_url:
+        print(f"Playing audio: {audio_url}")
+        response.play(audio_url)
+    else:
+        # Fallback to Twilio's native TTS if CambAI fails
+        print("Using fallback TTS")
+        response.say(reply, voice="Polly.Joanna", language="en-US")
     
-    # If conversation not ended, record next response
+    # Continue or hang up
     if session.state not in [ConversationState.REJECTED, ConversationState.COMPLETED]:
+        print("Recording next response...")
         response.record(
-            action=f"/twilio-webhook?session_id={session_id}",
-            max_length=30,
+            action=f"{PUBLIC_URL}/twilio-webhook?session_id={session_id}",
+            max_length=60,  # Increased to 60 seconds
             play_beep=True,
-            trim="trim-silence"
+            trim="trim-silence",
+            timeout=5
         )
     else:
+        print("Conversation ended")
         response.hangup()
     
-    return Response(content=str(response), media_type="application/xml")
+    twiml_content = str(response)
+    print(f"TwiML: {twiml_content[:200]}...")
+    
+    return Response(content=twiml_content, media_type="application/xml")
 
 @app.post("/call-status")
 async def call_status(session_id: str = None, CallStatus: str = None):
@@ -426,3 +480,4 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
