@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: riya-voice-agent
+    name: agent-rec
     runtime: python
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
@@ -18,4 +18,5 @@ services:
       - key: TWILIO_PHONE_NUMBER
         sync: false
       - key: PUBLIC_URL
+
         sync: false
