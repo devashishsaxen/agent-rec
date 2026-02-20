@@ -3,9 +3,12 @@ import requests
 import uuid
 import re
 import tempfile
+import json
+import asyncio
 from enum import Enum
 from pathlib import Path
 from urllib.parse import urlencode
+from datetime import datetime, timedelta
 import assemblyai as aai
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,8 +18,12 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Record, Play, Say
+import httpx
+import redis
 
 load_dotenv()
+
+# Configuration
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 CAMB_API_KEY = os.getenv("CAMB_API_KEY")
@@ -25,13 +32,81 @@ TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE = os.getenv("TWILIO_PHONE_NUMBER")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8000")
 
-# Setup
+# Setup AssemblyAI
 aai.settings.api_key = ASSEMBLYAI_API_KEY
+
+# Audio temp directory
 TEMP_AUDIO_DIR = Path(tempfile.gettempdir()) / "riya_audio"
 TEMP_AUDIO_DIR.mkdir(exist_ok=True)
 
 # Twilio client
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and TWILIO_TOKEN else None
+
+# ================= REDIS & SESSION MANAGEMENT =================
+
+redis_client = None
+try:
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
+        redis_client.ping()
+        print("✅ Redis connected")
+    else:
+        print("⚠️  No REDIS_URL found, using in-memory sessions (will break on Render restart)")
+except Exception as e:
+    print(f"❌ Redis connection failed: {e}")
+    redis_client = None
+
+class SessionManager:
+    def __init__(self):
+        self.local_sessions = {}
+        self.ttl = 3600  # 1 hour
+    
+    def save(self, session_id: str, session_data):
+        """Save session to Redis or memory"""
+        try:
+            data = {
+                'state': session_data.state.value,
+                'candidate_type': session_data.candidate_type,
+                'retry_count': session_data.retry_count,
+                'answers': session_data.answers,
+                'phone_number': session_data.phone_number,
+                'conversation': session_data.conversation
+            }
+            
+            if redis_client:
+                redis_client.setex(f"riya:session:{session_id}", self.ttl, json.dumps(data))
+            else:
+                self.local_sessions[session_id] = data
+        except Exception as e:
+            print(f"Redis save error: {e}, falling back to memory")
+            self.local_sessions[session_id] = data
+    
+    def get(self, session_id: str):
+        """Retrieve session from Redis or memory"""
+        try:
+            if redis_client:
+                data = redis_client.get(f"riya:session:{session_id}")
+                if data:
+                    return json.loads(data)
+            return self.local_sessions.get(session_id)
+        except Exception as e:
+            print(f"Redis get error: {e}")
+            return self.local_sessions.get(session_id)
+    
+    def delete(self, session_id: str):
+        """Delete session"""
+        try:
+            if redis_client:
+                redis_client.delete(f"riya:session:{session_id}")
+            if session_id in self.local_sessions:
+                del self.local_sessions[session_id]
+        except Exception as e:
+            print(f"Redis delete error: {e}")
+
+session_mgr = SessionManager()
+
+# ================= APP SETUP =================
 
 app = FastAPI()
 
@@ -56,14 +131,30 @@ class ConversationState(str, Enum):
     REJECTED = "rejected"
 
 class SessionData:
-    def __init__(self, phone_number=None):
-        self.conversation = []
-        self.state = ConversationState.GREETING
-        self.candidate_type = None
-        self.retry_count = 0
-        self.answers = {}
+    def __init__(self, phone_number=None, state=None, candidate_type=None, retry_count=0, answers=None, conversation=None):
+        self.conversation = conversation or []
+        self.state = state or ConversationState.GREETING
+        self.candidate_type = candidate_type
+        self.retry_count = retry_count
+        self.answers = answers or {}
         self.phone_number = phone_number
         self.current_audio_url = None
+    
+    @classmethod
+    def from_dict(cls, data):
+        """Create SessionData from Redis dict"""
+        if not data:
+            return None
+        return cls(
+            phone_number=data.get('phone_number'),
+            state=ConversationState(data.get('state', 'greeting')),
+            candidate_type=data.get('candidate_type'),
+            retry_count=data.get('retry_count', 0),
+            answers=data.get('answers', {}),
+            conversation=data.get('conversation', [])
+        )
+
+# ================= AUDIO & AI FUNCTIONS =================
 
 def generate_tts(text: str, session_id: str) -> str:
     """Generate TTS using CambAI REST API."""
@@ -90,7 +181,6 @@ def generate_tts(text: str, session_id: str) -> str:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-            # Return public URL for Twilio to access
             return f"{PUBLIC_URL}/audio/{audio_id}"
         return None
     except Exception as e:
@@ -196,19 +286,49 @@ def get_reply(session: SessionData, user_input: str) -> str:
     
     return "I'm sorry, could you please repeat that?"
 
-# Store sessions
-sessions = {}
+# ================= KEEP-ALIVE & HEALTH =================
 
-@app.get("/")
-def read_root():
-    return FileResponse("index.html")
+async def keep_alive_ping():
+    """Ping the service every 10 minutes to prevent Render spin-down"""
+    public_url = os.getenv("PUBLIC_URL")
+    if not public_url or "localhost" in public_url:
+        return
+    
+    await asyncio.sleep(30)  # Wait for app to fully start
+    
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.get(f"{public_url}/health", timeout=10.0)
+                print(f"[{datetime.now()}] Keep-alive ping sent")
+        except Exception as e:
+            print(f"Keep-alive failed: {e}")
+        
+        await asyncio.sleep(600)  # 10 minutes
 
-@app.get("/audio/{audio_id}")
-def get_audio(audio_id: str):
-    audio_path = TEMP_AUDIO_DIR / audio_id
-    if audio_path.exists():
-        return FileResponse(audio_path, media_type="audio/wav")
-    raise HTTPException(status_code=404, detail="Audio not found")
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks"""
+    asyncio.create_task(keep_alive_ping())
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for keep-alive and monitoring"""
+    active_sessions = 0
+    try:
+        if redis_client:
+            active_sessions = len(redis_client.keys("riya:session:*"))
+        else:
+            active_sessions = len(session_mgr.local_sessions)
+    except:
+        pass
+    
+    return {
+        "status": "alive",
+        "timestamp": datetime.utcnow().isoformat(),
+        "active_sessions": active_sessions,
+        "redis_connected": redis_client is not None
+    }
 
 # ================= TWILIO CALL HANDLING =================
 
@@ -221,12 +341,13 @@ async def initiate_call(phone_number: str = Form(...)):
     # Create session for this call
     session_id = str(uuid.uuid4())
     session = SessionData(phone_number=phone_number)
-    sessions[session_id] = session
     
-    # Generate opening audio
-    opening_text = get_reply(session, "")
-    audio_url = generate_tts(opening_text, session_id)
-    session.current_audio_url = audio_url
+    # Save to Redis immediately (CRITICAL for Render restarts)
+    session_mgr.save(session_id, session)
+    print(f"Session created and saved: {session_id}")
+    
+    # DO NOT call get_reply here - let the webhook handle the first greeting
+    # This keeps state as GREETING until Twilio webhook is hit
     
     try:
         call = twilio_client.calls.create(
@@ -254,32 +375,37 @@ async def twilio_webhook(
     RecordingUrl: str = None,
     CallStatus: str = None
 ):
-    """Handle Twilio webhooks with error recovery."""
+    """Handle Twilio webhooks with Redis session recovery."""
     response = VoiceResponse()
     
     print(f"Webhook called - Session: {session_id}, Recording: {RecordingUrl}, Status: {CallStatus}")
     
-    if not session_id or session_id not in sessions:
-        print("ERROR: Session not found")
+    if not session_id:
+        print("ERROR: No session_id provided")
+        response.say("Sorry, invalid session. Please call again.")
+        return Response(content=str(response), media_type="application/xml")
+    
+    # Load session from Redis (survives Render restarts!)
+    session_data = session_mgr.get(session_id)
+    if not session_data:
+        print("ERROR: Session not found in Redis")
         response.say("Sorry, this session has expired. Please call again.")
         return Response(content=str(response), media_type="application/xml")
     
-    session = sessions[session_id]
+    session = SessionData.from_dict(session_data)
+    print(f"Session loaded: {session_id}, State: {session.state}")
     
     # Process recording if present
     if RecordingUrl:
         try:
             print(f"Downloading recording from: {RecordingUrl}")
-            # Download recording
             audio_content = requests.get(RecordingUrl, timeout=30).content
             
-            # Save temporarily
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
                 tmp.write(audio_content)
                 tmp_path = tmp.name
             
             print("Transcribing with AssemblyAI...")
-            # Transcribe
             config = aai.TranscriptionConfig(
                 speech_models=["universal-2"], 
                 language_code="en_us"
@@ -287,7 +413,6 @@ async def twilio_webhook(
             transcriber = aai.Transcriber(config=config)
             transcript = transcriber.transcribe(tmp_path)
             
-            # Cleanup
             os.unlink(tmp_path)
             
             if transcript.status == "error":
@@ -301,12 +426,20 @@ async def twilio_webhook(
             print(f"Transcription failed: {e}")
             user_input = ""
     else:
-        print("No recording, first call")
+        print("No recording received")
         user_input = ""
+    
+    # CRITICAL FIX: Check if this is the first call (no recording + GREETING state)
+    is_first_call = (not RecordingUrl) and (session.state == ConversationState.GREETING)
     
     # Get reply from conversation flow
     try:
-        if not user_input or not user_input.strip():
+        if is_first_call:
+            # First call - play the greeting (state will advance to INTEREST_CHECK)
+            reply = get_reply(session, "")
+            print(f"First call - Riya greets: {reply[:60]}...")
+        elif not user_input or not user_input.strip():
+            # Empty input on subsequent calls (not first call)
             if session.state in [ConversationState.CUSTOMER_STORY, ConversationState.FESTIVAL_STORY]:
                 session.retry_count += 1
                 if session.retry_count >= 2:
@@ -321,9 +454,9 @@ async def twilio_webhook(
             else:
                 reply = "I didn't catch that. Could you please speak up?"
         else:
+            # Normal flow with user input
             reply = get_reply(session, user_input)
-        
-        print(f"Riya replies: {reply}")
+            print(f"Riya replies: {reply}")
         
     except Exception as e:
         print(f"Conversation flow error: {e}")
@@ -344,7 +477,6 @@ async def twilio_webhook(
         print(f"Playing audio: {audio_url}")
         response.play(audio_url)
     else:
-        # Fallback to Twilio's native TTS if CambAI fails
         print("Using fallback TTS")
         response.say(reply, voice="Polly.Joanna", language="en-US")
     
@@ -353,7 +485,7 @@ async def twilio_webhook(
         print("Recording next response...")
         response.record(
             action=f"{PUBLIC_URL}/twilio-webhook?session_id={session_id}",
-            max_length=60,  # Increased to 60 seconds
+            max_length=60,
             play_beep=True,
             trim="trim-silence",
             timeout=5
@@ -362,8 +494,11 @@ async def twilio_webhook(
         print("Conversation ended")
         response.hangup()
     
+    # CRITICAL: Save session back to Redis after processing
+    session_mgr.save(session_id, session)
+    
     twiml_content = str(response)
-    print(f"TwiML: {twiml_content[:200]}...")
+    print(f"TwiML length: {len(twiml_content)} chars")
     
     return Response(content=twiml_content, media_type="application/xml")
 
@@ -371,12 +506,26 @@ async def twilio_webhook(
 async def call_status(session_id: str = None, CallStatus: str = None):
     """Handle call status callbacks."""
     print(f"Call status for {session_id}: {CallStatus}")
-    if session_id in sessions and CallStatus in ["completed", "busy", "failed"]:
-        # Cleanup old sessions
+    
+    # Optional: Clean up completed sessions after some time
+    if CallStatus in ["completed", "busy", "failed", "canceled"]:
+        # Keep for a bit for debugging, then delete
         pass
+    
     return {"status": "ok"}
 
-# ================= WEB INTERFACE =================
+# ================= STATIC FILES & WEB INTERFACE =================
+
+@app.get("/")
+def read_root():
+    return FileResponse("index.html")
+
+@app.get("/audio/{audio_id}")
+def get_audio(audio_id: str):
+    audio_path = TEMP_AUDIO_DIR / audio_id
+    if audio_path.exists():
+        return FileResponse(audio_path, media_type="audio/wav")
+    raise HTTPException(status_code=404, detail="Audio not found")
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -478,6 +627,4 @@ def dashboard():
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
