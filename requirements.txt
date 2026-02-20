@@ -5,4 +5,5 @@ requests
 assemblyai
 python-multipart
 twilio
+redis
 gunicorn
